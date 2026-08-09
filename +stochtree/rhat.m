@@ -15,6 +15,10 @@ function [R, stats] = rhat(draws, chainIdx)
 %   Each chain is split in half before the comparison, which catches chains
 %   that are individually drifting but happen to agree with each other.
 %
+%   At least two chains are required: the diagnostic works by comparing chains
+%   against one another, so a single chain is rejected rather than silently
+%   reduced to a within-chain comparison of its two halves.
+%
 %   Values near 1 suggest the chains have mixed. A common rule of thumb is to
 %   treat anything above 1.01 as a reason to run longer, though for BART the
 %   forest structure itself is not identified, so this is most informative
@@ -36,6 +40,12 @@ if nargin >= 2 && ~isempty(chainIdx)
     if isempty(labels)
         error('stochtree:value', 'chainIdx contains no chain labels above 0.');
     end
+    if numel(labels) < 2
+        error('stochtree:input', ...
+            ['R-hat compares chains against each other, and chainIdx contains ' ...
+             'only %d chain. Refit with ''NumChains'', 4 (or more) to get a ' ...
+             'convergence diagnostic.'], numel(labels));
+    end
     counts = arrayfun(@(c) sum(chainIdx == c), labels);
     if numel(unique(counts)) ~= 1
         error('stochtree:value', ...
@@ -50,8 +60,9 @@ else
     X = draws;
     if isvector(X)
         error('stochtree:input', ...
-            ['A single chain cannot be compared against anything. Pass an ' ...
-             'iterations-by-chains matrix, or supply a chain index vector.']);
+            ['R-hat compares chains against each other, and a vector is a ' ...
+             'single chain. Pass an iterations-by-chains matrix, or supply a ' ...
+             'chain index vector as the second argument.']);
     end
 end
 

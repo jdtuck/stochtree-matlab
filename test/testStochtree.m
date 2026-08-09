@@ -397,8 +397,16 @@ testCase.verifyEqual(stochtree.rhat(drawsWithGFR, idxWithGFR), R, 'AbsTol', 1e-1
 end
 
 function testRhatRejectsSingleChain(testCase)
+% Both spellings of "one chain" must be rejected, and with the same error,
+% since they are the same user mistake.
 testCase.verifyError(@() stochtree.rhat(randn(100,1)), 'stochtree:input');
-testCase.verifyError(@() stochtree.rhat(randn(10,1), ones(10,1)), 'stochtree:value');
+testCase.verifyError(@() stochtree.rhat(randn(10,1), ones(10,1)), 'stochtree:input');
+% Two short chains are legitimate, so this must not throw.
+testCase.verifyWarningFree(@() stochtree.rhat(randn(20,1), [ones(10,1); 2*ones(10,1)]));
+% Chains of different lengths cannot be compared.
+testCase.verifyError(@() stochtree.rhat(randn(15,1), [ones(10,1); 2*ones(5,1)]), ...
+    'stochtree:value');
+
 end
 
 function testConvergenceDiagnostics(testCase)
