@@ -13,10 +13,10 @@ This sits alongside the project's existing R and Python interfaces and wraps the
 ## Installation
 
 ```bash
-git clone --recursive https://github.com/StochasticTree/stochtree.git
+git clone --recurse-submodules https://github.com/jdtuck/stochtree-matlab
 ```
 
-The `--recursive` flag matters: Eigen, Boost.Math, fmt and fast_double_parser are git submodules. If you already cloned without it, run `git submodule update --init --recursive` inside the checkout.
+The `--recurse-submodules` flag matters: Eigen, Boost.Math, fmt and fast_double_parser are git submodules. If you already cloned without it, run `git submodule update --init --recursive` inside the checkout.
 
 Then, in MATLAB:
 
