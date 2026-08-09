@@ -23,9 +23,10 @@ XTest  = X(isTest, :);   yTest  = y(isTest);
 tic;
 model = stochtree.bart(XTrain, yTrain, ...
     'XTest', XTest, ...
-    'NumGFR', 10, ...        % XBART warm start
-    'NumBurnin', 100, ...
-    'NumMCMC', 500, ...
+    'NumGFR', 10, ...        % XBART warm start, shared by all chains
+    'NumBurnin', 200, ...    % per chain; matters when running several
+    'NumMCMC', 250, ...      % retained draws per chain
+    'NumChains', 4, ...      % 1000 draws in total
     'NumTrees', 100, ...
     'RandomSeed', 42);
 fprintf('Fit in %.1f s\n', toc);
@@ -43,6 +44,9 @@ fTest = f(XTest);
 coverage = mean(fTest >= ci(:,1) & fTest <= ci(:,2));
 fprintf('95%% interval coverage of the true mean function: %.1f%%\n', 100*coverage);
 
+%% Convergence across chains
+model.convergenceDiagnostics()
+
 %% Plots
 figure('Position', [100 100 1100 350]);
 
@@ -54,10 +58,12 @@ xlabel('True f(x)'); ylabel('Posterior mean'); title('Test set fit');
 axis square; grid on;
 
 subplot(1,3,2);
-plot(model.Sigma2Samples, 'LineWidth', 0.8);
-yline(sigma^2, 'r--', 'LineWidth', 1.2);
-xlabel('MCMC draw'); ylabel('\sigma^2'); title('Global variance trace');
-legend('draws', 'truth', 'Location', 'best'); grid on;
+plot(model.chainMatrix(model.Sigma2Samples), 'LineWidth', 0.8);
+yline(sigma^2, 'r--', 'LineWidth', 1.5);
+xlabel('Draw within chain'); ylabel('\sigma^2');
+title(sprintf('\\sigma^2 by chain (R-hat %.3f)', ...
+    stochtree.rhat(model.Sigma2Samples, model.ChainIndex)));
+grid on;
 
 subplot(1,3,3);
 counts = model.variableSplitCounts();

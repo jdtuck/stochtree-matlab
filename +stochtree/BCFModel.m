@@ -48,6 +48,8 @@ classdef BCFModel < handle
         NumGFR (1,1) double = 0
         NumBurnin (1,1) double = 0
         NumMCMC (1,1) double = 0
+        NumChains (1,1) double = 1
+        ChainIndex double = []
     end
 
     methods
@@ -177,6 +179,65 @@ classdef BCFModel < handle
             if nargin < 4, propensity = []; end
             p = obj.predict(X, Z, propensity);
             cate = mean(p.tau, 2);
+        end
+
+
+        function M = chainMatrix(obj, draws)
+            %CHAINMATRIX Reshape a per-draw vector into iterations-by-chains.
+            %   Warm start draws (chain label 0) are dropped. Useful for trace
+            %   plots: plot(model.chainMatrix(model.Sigma2Samples)).
+            draws = draws(:);
+            if numel(draws) ~= obj.NumSamples
+                error('stochtree:size', ...
+                    'draws has %d elements but the model holds %d.', ...
+                    numel(draws), obj.NumSamples);
+            end
+            idx = obj.ChainIndex(:);
+            labels = unique(idx(idx > 0));
+            if isempty(labels)
+                M = draws;
+                return
+            end
+            counts = arrayfun(@(c) sum(idx == c), labels);
+            if numel(unique(counts)) ~= 1
+                error('stochtree:value', 'Chains have unequal lengths.');
+            end
+            M = zeros(counts(1), numel(labels));
+            for c = 1:numel(labels)
+                M(:, c) = draws(idx == labels(c));
+            end
+        end
+
+        function d = convergenceDiagnostics(obj)
+            %CONVERGENCEDIAGNOSTICS Split R-hat for the sampled quantities.
+            %   With a single chain there is nothing to compare against, so
+            %   the values are NaN and a note explains why.
+            d = struct();
+            d.numChains = obj.NumChains;
+            if obj.NumChains < 2
+                d.note = ['R-hat needs at least two chains. Refit with ' ...
+                    '''NumChains'', 4 to get a convergence diagnostic.'];
+            end
+            if obj.NumChains >= 2
+                if ~isempty(obj.Sigma2Samples) && obj.SampleSigma2Global
+                    d.sigma2Rhat = stochtree.rhat(obj.Sigma2Samples, obj.ChainIndex);
+                end
+                if ~isempty(obj.TauHatTrain)
+                    d.ateRhat = stochtree.rhat(obj.ateSamples(), obj.ChainIndex);
+                    nRows = size(obj.TauHatTrain, 1);
+                    probe = unique(round(linspace(1, nRows, min(50, nRows))));
+                    rs = arrayfun(@(i) stochtree.rhat(obj.TauHatTrain(i, :)', ...
+                        obj.ChainIndex), probe);
+                    d.cateRhatMax = max(rs);
+                    d.cateRhatMedian = median(rs);
+                end
+            else
+                d.sigma2Rhat = NaN;
+            end
+            if nargout == 0
+                disp(d);
+                clear d
+            end
         end
 
         function s = toStruct(obj)

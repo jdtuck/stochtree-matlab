@@ -30,8 +30,13 @@ function model = bcf(X, Z, y, varargin)
 %
 %   Sampler options
 %     'NumGFR'      Default 5.      'NumBurnin'  Default 0.
-%     'NumMCMC'     Default 100.    'KeepGFR'    Default false.
-%     'KeepBurnin'  Default false.  'KeepEvery'  Default 1.
+%     'NumMCMC'     Retained draws per chain. Default 100.
+%     'KeepGFR'     Default false.  'KeepBurnin' Default false.
+%     'KeepEvery'   Thinning interval. NumMCMC*KeepEvery iterations run and
+%                   NumMCMC are retained, per chain. Default 1.
+%     'NumChains'   Independent MCMC chains, each warm started from its own
+%                   grow-from-root draw. Cannot exceed NumGFR unless NumGFR is
+%                   0. Total retained draws are NumChains*NumMCMC. Default 1.
 %     'RandomSeed'  Seeds both the C++ RNG and MATLAB's RNG (the adaptive
 %                   coding step draws from the latter). Default [].
 %     'NumThreads'  Default 1.      'Verbose'    Default false.
@@ -218,6 +223,9 @@ else
     currentLeafScaleTau = sigma2LeafTau;
 end
 
+initialLeafScaleMu = currentLeafScaleMu;
+initialLeafScaleTau = currentLeafScaleTau;
+
 sampleSigma2LeafTau = opts.SampleSigma2LeafTau && ~multivariateTreatment;
 
 includeVarianceForest = opts.NumTreesVariance > 0;
@@ -304,18 +312,35 @@ leafVarModelTau = stochtree.LeafVarianceModel();
 numGFR = opts.NumGFR;
 numBurnin = opts.NumBurnin;
 numMCMC = opts.NumMCMC;
-numTotal = numGFR + numBurnin + numMCMC;
-if numTotal == 0
+numChains = opts.NumChains;
+keepEvery = opts.KeepEvery;
+if numGFR + numBurnin + numMCMC == 0
     error('stochtree:value', 'NumGFR + NumBurnin + NumMCMC must be positive.');
 end
-numRetained = numGFR + opts.KeepBurnin * numBurnin + floor(numMCMC / opts.KeepEvery);
+if numChains < 1 || mod(numChains, 1) ~= 0
+    error('stochtree:value', 'NumChains must be a positive integer.');
+end
+if numGFR > 0 && numChains > numGFR
+    error('stochtree:value', ...
+        ['NumChains (%d) cannot exceed NumGFR (%d). Each chain warm starts from ' ...
+         'its own grow-from-root draw. Raise NumGFR, lower NumChains, or set ' ...
+         'NumGFR to 0 to start every chain from the root instead.'], ...
+        numChains, numGFR);
+end
+
+% Every warm start draw is retained up front and pruned afterwards if KeepGFR
+% is false, so that chain c can restart from draw numGFR-c+1 by index.
+perChain = opts.KeepBurnin * numBurnin + numMCMC;
+numRetained = numGFR + numChains * perChain;
 
 globalVarSamples = nan(numRetained, 1);
 leafScaleMuSamples = nan(numRetained, 1);
 leafScaleTauSamples = nan(numRetained, 1);
 b0Samples = nan(numRetained, 1);
 b1Samples = nan(numRetained, 1);
+chainIndex = zeros(numRetained, 1);    % 0 marks a shared warm start draw
 sampleCounter = 0;
+currentChain = 0;
 
 muOpts = struct('cutpointGridSize', opts.CutpointGridSize, ...
     'leafModelScale', currentLeafScaleMu, 'variableWeights', variableWeightsMu, ...
@@ -330,100 +355,31 @@ varOpts = muOpts;
 varOpts.leafModel = 3;
 varOpts.leafModelScale = 1.0;
 
-for iter = 1:numTotal
-    isGFR = iter <= numGFR;
-    if isGFR
-        keepSample = true;
-    elseif iter <= numGFR + numBurnin
-        keepSample = opts.KeepBurnin;
-    else
-        keepSample = mod(iter - numGFR - numBurnin, opts.KeepEvery) == 0;
-    end
-    if keepSample, sampleCounter = sampleCounter + 1; end
-
-    % --- Prognostic forest
-    muOpts.gfr = isGFR;
-    muOpts.keepForest = keepSample;
-    muOpts.globalVariance = currentSigma2;
-    muOpts.leafModelScale = currentLeafScaleMu;
-    samplerMu.sampleOneIteration(containerMu, activeForestMu, dataset, residual, ...
-        cppRng, muOpts);
-
-    if opts.SampleSigma2Global
-        currentSigma2 = globalVarModel.sample(residual, cppRng, ...
-            opts.Sigma2GlobalShape, opts.Sigma2GlobalScale);
-    end
-    if opts.SampleSigma2LeafMu
-        currentLeafScaleMu = leafVarModelMu.sample(activeForestMu, cppRng, ...
-            opts.Sigma2LeafMuShape, bLeafMu);
-        if keepSample, leafScaleMuSamples(sampleCounter) = currentLeafScaleMu; end
-    end
-
-    % --- Treatment effect forest
-    tauOpts.gfr = isGFR;
-    tauOpts.keepForest = keepSample;
-    tauOpts.globalVariance = currentSigma2;
-    tauOpts.leafModelScale = currentLeafScaleTau;
-    samplerTau.sampleOneIteration(containerTau, activeForestTau, dataset, residual, ...
-        cppRng, tauOpts);
-
-    % --- Adaptive coding parameters b_0 and b_1
-    if adaptiveCoding
-        muX = activeForestMu.predictRaw(dataset);
-        tauX = activeForestTau.predictRaw(dataset);
-        % Regress the outcome net of the prognostic term on tau(x) separately
-        % within the treated and control arms. Note this uses the standardized
-        % outcome, not the running residual, which already has both forests
-        % subtracted out.
-        partialResid = residTrain - muX;
-        isControl = Z(:, 1) == 0;
-        isTreated = ~isControl;
-
-        sTT0 = sum(tauX(isControl).^2);
-        sTT1 = sum(tauX(isTreated).^2);
-        sTY0 = sum(tauX(isControl) .* partialResid(isControl));
-        sTY1 = sum(tauX(isTreated) .* partialResid(isTreated));
-
-        % N(0, 1/2) priors on b_0 and b_1 give these full conditionals.
-        currentB0 = (sTY0 / (sTT0 + 2 * currentSigma2)) + ...
-            sqrt(currentSigma2 / (sTT0 + 2 * currentSigma2)) * randn();
-        currentB1 = (sTY1 / (sTT1 + 2 * currentSigma2)) + ...
-            sqrt(currentSigma2 / (sTT1 + 2 * currentSigma2)) * randn();
-
-        tauBasis = (1 - Z) * currentB0 + Z * currentB1;
-        dataset.updateBasis(tauBasis);
-        % The residual is stale now that the basis changed, so recompute the
-        % tau forest's contribution through the tracker.
-        samplerTau.propagateBasisUpdate(dataset, residual, activeForestTau);
-
-        if keepSample
-            b0Samples(sampleCounter) = currentB0;
-            b1Samples(sampleCounter) = currentB1;
-        end
-    end
-
-    if sampleSigma2LeafTau
-        currentLeafScaleTau = leafVarModelTau.sample(activeForestTau, cppRng, ...
-            opts.Sigma2LeafTauShape, bLeafTau);
-        if keepSample, leafScaleTauSamples(sampleCounter) = currentLeafScaleTau; end
-    end
-
-    % --- Variance forest
-    if includeVarianceForest
-        varOpts.gfr = isGFR;
-        varOpts.keepForest = keepSample;
-        varOpts.globalVariance = currentSigma2;
-        samplerVar.sampleOneIteration(containerVar, activeForestVar, dataset, ...
-            residual, cppRng, varOpts);
-    end
-
-    if opts.SampleSigma2Global && keepSample
-        globalVarSamples(sampleCounter) = currentSigma2;
-    end
-
+% Stage 1: one grow-from-root warm start, shared by every chain.
+for iter = 1:numGFR
+    iSweep(true, true);
     if opts.Verbose && mod(iter, 25) == 0
-        fprintf('stochtree.bcf: iteration %d of %d (sigma^2 = %.4f)\n', ...
-            iter, numTotal, currentSigma2);
+        fprintf('stochtree.bcf: warm start %d of %d (sigma^2 = %.4f)\n', ...
+            iter, numGFR, currentSigma2);
+    end
+end
+
+% Stage 2: independent MCMC chains, each restarted from its own warm start.
+numChainIters = numBurnin + numMCMC * keepEvery;
+for chain = 1:numChains
+    currentChain = chain;
+    iResetChain(chain);
+    for iter = 1:numChainIters
+        if iter <= numBurnin
+            keepSample = opts.KeepBurnin;
+        else
+            keepSample = mod(iter - numBurnin, keepEvery) == 0;
+        end
+        iSweep(false, keepSample);
+        if opts.Verbose && mod(iter, 25) == 0
+            fprintf('stochtree.bcf: chain %d/%d, iteration %d/%d (sigma^2 = %.4f)\n', ...
+                chain, numChains, iter, numChainIters, currentSigma2);
+        end
     end
 end
 
@@ -433,12 +389,13 @@ if numGFR > 0 && ~opts.KeepGFR
         containerTau.deleteSample(1);
         if includeVarianceForest, containerVar.deleteSample(1); end
     end
-    keep = (numGFR + 1):numRetained;
-    globalVarSamples = globalVarSamples(keep);
-    leafScaleMuSamples = leafScaleMuSamples(keep);
-    leafScaleTauSamples = leafScaleTauSamples(keep);
-    b0Samples = b0Samples(keep);
-    b1Samples = b1Samples(keep);
+    keepIdx = (numGFR + 1):numRetained;
+    globalVarSamples = globalVarSamples(keepIdx);
+    leafScaleMuSamples = leafScaleMuSamples(keepIdx);
+    leafScaleTauSamples = leafScaleTauSamples(keepIdx);
+    b0Samples = b0Samples(keepIdx);
+    b1Samples = b1Samples(keepIdx);
+    chainIndex = chainIndex(keepIdx);
 end
 
 %% ---- Assemble the model ----------------------------------------------
@@ -469,6 +426,8 @@ model.B1Samples = b1Samples;
 model.NumGFR = numGFR;
 model.NumBurnin = numBurnin;
 model.NumMCMC = numMCMC;
+model.NumChains = numChains;
+model.ChainIndex = chainIndex;
 
 trainPred = model.predict(X, Z, propensityTrain);
 model.MuHatTrain = trainPred.mu;
@@ -491,6 +450,173 @@ if ~isempty(opts.XTest)
         model.Sigma2XTest = testPred.sigma2x;
     end
 end
+
+%% ---- Nested helpers ---------------------------------------------------
+    function iSweep(isGFR, keepSample)
+        % One full Gibbs sweep: prognostic forest, variance parameters,
+        % treatment forest, adaptive coding, then the variance forest.
+        if keepSample
+            sampleCounter = sampleCounter + 1;
+            chainIndex(sampleCounter) = currentChain;
+        end
+
+        % --- Prognostic forest
+        muOpts.gfr = isGFR;
+        muOpts.keepForest = keepSample;
+        muOpts.globalVariance = currentSigma2;
+        muOpts.leafModelScale = currentLeafScaleMu;
+        samplerMu.sampleOneIteration(containerMu, activeForestMu, dataset, ...
+            residual, cppRng, muOpts);
+
+        if opts.SampleSigma2Global
+            currentSigma2 = globalVarModel.sample(residual, cppRng, ...
+                opts.Sigma2GlobalShape, opts.Sigma2GlobalScale);
+        end
+        if opts.SampleSigma2LeafMu
+            currentLeafScaleMu = leafVarModelMu.sample(activeForestMu, cppRng, ...
+                opts.Sigma2LeafMuShape, bLeafMu);
+            if keepSample
+                leafScaleMuSamples(sampleCounter) = currentLeafScaleMu;
+            end
+        end
+
+        % --- Treatment effect forest
+        tauOpts.gfr = isGFR;
+        tauOpts.keepForest = keepSample;
+        tauOpts.globalVariance = currentSigma2;
+        tauOpts.leafModelScale = currentLeafScaleTau;
+        samplerTau.sampleOneIteration(containerTau, activeForestTau, dataset, ...
+            residual, cppRng, tauOpts);
+
+        % --- Adaptive coding parameters b_0 and b_1
+        if adaptiveCoding
+            muX = activeForestMu.predictRaw(dataset);
+            tauX = activeForestTau.predictRaw(dataset);
+            % Regress the outcome net of the prognostic term on tau(x)
+            % separately within the treated and control arms. This uses the
+            % standardized outcome, not the running residual, which already
+            % has both forests subtracted out.
+            partialResid = residTrain - muX;
+            isControl = Z(:, 1) == 0;
+            isTreated = ~isControl;
+
+            sTT0 = sum(tauX(isControl).^2);
+            sTT1 = sum(tauX(isTreated).^2);
+            sTY0 = sum(tauX(isControl) .* partialResid(isControl));
+            sTY1 = sum(tauX(isTreated) .* partialResid(isTreated));
+
+            % N(0, 1/2) priors on b_0 and b_1 give these full conditionals.
+            currentB0 = (sTY0 / (sTT0 + 2 * currentSigma2)) + ...
+                sqrt(currentSigma2 / (sTT0 + 2 * currentSigma2)) * randn();
+            currentB1 = (sTY1 / (sTT1 + 2 * currentSigma2)) + ...
+                sqrt(currentSigma2 / (sTT1 + 2 * currentSigma2)) * randn();
+
+            iApplyCoding();
+
+            if keepSample
+                b0Samples(sampleCounter) = currentB0;
+                b1Samples(sampleCounter) = currentB1;
+            end
+        end
+
+        if sampleSigma2LeafTau
+            currentLeafScaleTau = leafVarModelTau.sample(activeForestTau, cppRng, ...
+                opts.Sigma2LeafTauShape, bLeafTau);
+            if keepSample
+                leafScaleTauSamples(sampleCounter) = currentLeafScaleTau;
+            end
+        end
+
+        % --- Variance forest
+        if includeVarianceForest
+            varOpts.gfr = isGFR;
+            varOpts.keepForest = keepSample;
+            varOpts.globalVariance = currentSigma2;
+            samplerVar.sampleOneIteration(containerVar, activeForestVar, dataset, ...
+                residual, cppRng, varOpts);
+        end
+
+        if opts.SampleSigma2Global && keepSample
+            globalVarSamples(sampleCounter) = currentSigma2;
+        end
+    end
+
+    function iApplyCoding()
+        % Rebuild the treatment basis from the current b_0 and b_1 and push it
+        % through the tau tracker, which is stale until the residual is
+        % recomputed against the new basis.
+        tauBasis = (1 - Z) * currentB0 + Z * currentB1;
+        dataset.updateBasis(tauBasis);
+        samplerTau.propagateBasisUpdate(dataset, residual, activeForestTau);
+    end
+
+    function iResetChain(chain)
+        % Put the sampler back into a warm start state before running a chain.
+        %
+        % reconstitute() repairs the residual incrementally: it adds back the
+        % tracker's cached predictions and subtracts the new forest's. Both
+        % forests share one residual, so each is swapped in and reconstituted
+        % in turn, and the adaptive coding basis is reapplied last, once the
+        % tau tracker already matches the restored forest.
+        if numGFR > 0
+            forestInd = numGFR - chain + 1;
+
+            activeForestMu.resetFromContainer(containerMu, forestInd);
+            samplerMu.reconstitute(activeForestMu, dataset, residual, true);
+
+            activeForestTau.resetFromContainer(containerTau, forestInd);
+            samplerTau.reconstitute(activeForestTau, dataset, residual, true);
+
+            if includeVarianceForest
+                activeForestVar.resetFromContainer(containerVar, forestInd);
+                samplerVar.reconstitute(activeForestVar, dataset, residual, false);
+            end
+
+            if opts.SampleSigma2Global
+                currentSigma2 = globalVarSamples(forestInd);
+            end
+            if opts.SampleSigma2LeafMu
+                currentLeafScaleMu = leafScaleMuSamples(forestInd);
+            end
+            if sampleSigma2LeafTau
+                currentLeafScaleTau = leafScaleTauSamples(forestInd);
+            end
+            if adaptiveCoding
+                currentB0 = b0Samples(forestInd);
+                currentB1 = b1Samples(forestInd);
+                iApplyCoding();
+            end
+        else
+            % No warm start: every chain starts from stumps.
+            activeForestMu.resetRoot();
+            activeForestMu.setRootValue(mean(residTrain) / numTreesMu);
+            samplerMu.reconstitute(activeForestMu, dataset, residual, true);
+
+            activeForestTau.resetRoot();
+            if multivariateTreatment
+                activeForestTau.setRootVector(zeros(treatmentDim, 1));
+            else
+                activeForestTau.setRootValue(0);
+            end
+            samplerTau.reconstitute(activeForestTau, dataset, residual, true);
+
+            if includeVarianceForest
+                activeForestVar.resetRoot();
+                activeForestVar.setRootValue( ...
+                    log(varianceForestLeafInit) / opts.NumTreesVariance);
+                samplerVar.reconstitute(activeForestVar, dataset, residual, false);
+            end
+
+            currentSigma2 = sigma2Init;
+            currentLeafScaleMu = initialLeafScaleMu;
+            currentLeafScaleTau = initialLeafScaleTau;
+            if adaptiveCoding
+                currentB0 = opts.B0Init;
+                currentB1 = opts.B1Init;
+                iApplyCoding();
+            end
+        end
+    end
 end
 
 % -------------------------------------------------------------------------
@@ -513,6 +639,7 @@ addParameter(q, 'NumMCMC', 100);
 addParameter(q, 'KeepGFR', false);
 addParameter(q, 'KeepBurnin', false);
 addParameter(q, 'KeepEvery', 1);
+addParameter(q, 'NumChains', 1);
 addParameter(q, 'RandomSeed', []);
 addParameter(q, 'NumThreads', 1);
 addParameter(q, 'CutpointGridSize', 100);

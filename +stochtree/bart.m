@@ -25,10 +25,15 @@ function model = bart(X, y, varargin)
 %   Sampler options
 %     'NumGFR'         Grow-from-root warm start iterations. Default 5.
 %     'NumBurnin'      MCMC burn-in iterations. Default 0.
-%     'NumMCMC'        Retained MCMC iterations. Default 100.
+%     'NumMCMC'        Retained MCMC draws per chain. Default 100.
 %     'KeepGFR'        Retain the warm start draws. Default false.
 %     'KeepBurnin'     Retain the burn-in draws. Default false.
-%     'KeepEvery'      Thinning interval for MCMC draws. Default 1.
+%     'KeepEvery'      Thinning interval. NumMCMC*KeepEvery iterations run and
+%                      NumMCMC are retained, per chain. Default 1.
+%     'NumChains'      Independent MCMC chains, each warm started from its own
+%                      grow-from-root draw. Cannot exceed NumGFR unless NumGFR
+%                      is 0, in which case every chain starts from a stump.
+%                      Total retained draws are NumChains*NumMCMC. Default 1.
 %     'RandomSeed'     Seed for the C++ RNG. Default [] (nondeterministic).
 %     'NumThreads'     OpenMP threads. Default 1. Use -1 for all available.
 %     'CutpointGridSize'  Candidate cutpoints per feature in GFR. Default 100.
@@ -174,6 +179,8 @@ else
     currentLeafScale = leafScaleDiag;
 end
 
+initialLeafScale = currentLeafScale;
+
 % The leaf variance Gibbs step is only defined for scalar leaf scales.
 sampleSigma2Leaf = opts.SampleSigma2Leaf && leafModel ~= 2;
 
@@ -240,20 +247,33 @@ leafVarModel = stochtree.LeafVarianceModel();
 numGFR = opts.NumGFR;
 numBurnin = opts.NumBurnin;
 numMCMC = opts.NumMCMC;
-numTotal = numGFR + numBurnin + numMCMC;
-if numTotal == 0
+numChains = opts.NumChains;
+keepEvery = opts.KeepEvery;
+if numGFR + numBurnin + numMCMC == 0
     error('stochtree:value', 'NumGFR + NumBurnin + NumMCMC must be positive.');
 end
+if numChains < 1 || mod(numChains, 1) ~= 0
+    error('stochtree:value', 'NumChains must be a positive integer.');
+end
+if numGFR > 0 && numChains > numGFR
+    error('stochtree:value', ...
+        ['NumChains (%d) cannot exceed NumGFR (%d). Each chain warm starts from ' ...
+         'its own grow-from-root draw. Raise NumGFR, lower NumChains, or set ' ...
+         'NumGFR to 0 to start every chain from the root instead.'], ...
+        numChains, numGFR);
+end
 
-% Every GFR draw is retained up front and pruned afterwards if KeepGFR is
-% false, which mirrors the Python implementation and keeps indexing simple.
-numRetained = numGFR ...
-    + opts.KeepBurnin * numBurnin ...
-    + floor(numMCMC / opts.KeepEvery);
+% Every warm start draw is retained up front and pruned afterwards if KeepGFR
+% is false. Leaving them in the container while the chains run lets chain c
+% warm start from draw numGFR-c+1 by index.
+perChain = opts.KeepBurnin * numBurnin + numMCMC;
+numRetained = numGFR + numChains * perChain;
 
 globalVarSamples = nan(numRetained, 1);
 leafScaleSamples = nan(numRetained, 1);
+chainIndex = zeros(numRetained, 1);    % 0 marks a shared warm start draw
 sampleCounter = 0;
+currentChain = 0;
 
 meanOpts = struct( ...
     'cutpointGridSize', opts.CutpointGridSize, ...
@@ -272,52 +292,31 @@ varOpts = meanOpts;
 varOpts.leafModel = 3;
 varOpts.leafModelScale = 1.0;
 
-for iter = 1:numTotal
-    isGFR = iter <= numGFR;
-    if isGFR
-        keepSample = true;
-    elseif iter <= numGFR + numBurnin
-        keepSample = opts.KeepBurnin;
-    else
-        mcmcCounter = iter - numGFR - numBurnin;
-        keepSample = mod(mcmcCounter, opts.KeepEvery) == 0;
-    end
-    if keepSample, sampleCounter = sampleCounter + 1; end
-
-    % --- Mean forest
-    meanOpts.gfr = isGFR;
-    meanOpts.keepForest = keepSample;
-    meanOpts.globalVariance = currentSigma2;
-    meanOpts.leafModelScale = currentLeafScale;
-    samplerMean.sampleOneIteration(forestContainerMean, activeForestMean, ...
-        datasetTrain, residual, cppRng, meanOpts);
-
-    % --- Variance forest
-    if includeVarianceForest
-        varOpts.gfr = isGFR;
-        varOpts.keepForest = keepSample;
-        varOpts.globalVariance = currentSigma2;
-        samplerVar.sampleOneIteration(forestContainerVar, activeForestVar, ...
-            datasetTrain, residual, cppRng, varOpts);
-    end
-
-    % --- Variance parameters
-    if opts.SampleSigma2Global
-        currentSigma2 = globalVarModel.sample(residual, cppRng, aGlobal, bGlobal);
-        if keepSample
-            globalVarSamples(sampleCounter) = currentSigma2;
-        end
-    end
-    if sampleSigma2Leaf
-        currentLeafScale = leafVarModel.sample(activeForestMean, cppRng, aLeaf, bLeaf);
-        if keepSample
-            leafScaleSamples(sampleCounter) = currentLeafScale;
-        end
-    end
-
+% Stage 1: one grow-from-root warm start, shared by every chain.
+for iter = 1:numGFR
+    iSweep(true, true);
     if opts.Verbose && mod(iter, 25) == 0
-        fprintf('stochtree.bart: iteration %d of %d (sigma^2 = %.4f)\n', ...
-            iter, numTotal, currentSigma2);
+        fprintf('stochtree.bart: warm start %d of %d (sigma^2 = %.4f)\n', ...
+            iter, numGFR, currentSigma2);
+    end
+end
+
+% Stage 2: independent MCMC chains, each restarted from its own warm start.
+numChainIters = numBurnin + numMCMC * keepEvery;
+for chain = 1:numChains
+    currentChain = chain;
+    iResetChain(chain);
+    for iter = 1:numChainIters
+        if iter <= numBurnin
+            keepSample = opts.KeepBurnin;
+        else
+            keepSample = mod(iter - numBurnin, keepEvery) == 0;
+        end
+        iSweep(false, keepSample);
+        if opts.Verbose && mod(iter, 25) == 0
+            fprintf('stochtree.bart: chain %d/%d, iteration %d/%d (sigma^2 = %.4f)\n', ...
+                chain, numChains, iter, numChainIters, currentSigma2);
+        end
     end
 end
 
@@ -329,8 +328,10 @@ if numGFR > 0 && ~opts.KeepGFR
             forestContainerVar.deleteSample(1);
         end
     end
-    globalVarSamples = globalVarSamples(numGFR + 1:end);
-    leafScaleSamples = leafScaleSamples(numGFR + 1:end);
+    keepIdx = (numGFR + 1):numRetained;
+    globalVarSamples = globalVarSamples(keepIdx);
+    leafScaleSamples = leafScaleSamples(keepIdx);
+    chainIndex = chainIndex(keepIdx);
 end
 numSamples = forestContainerMean.numSamples();
 
@@ -354,6 +355,8 @@ model.IncludeVarianceForest = includeVarianceForest;
 model.NumGFR = numGFR;
 model.NumBurnin = numBurnin;
 model.NumMCMC = numMCMC;
+model.NumChains = numChains;
+model.ChainIndex = chainIndex;
 
 % Global variance draws are reported on the original outcome scale.
 model.Sigma2Samples = globalVarSamples * yStd^2;
@@ -380,6 +383,89 @@ if ~isempty(opts.XTest)
         model.Sigma2XTest = testPred.sigma2x;
     end
 end
+
+%% ---- Nested helpers ---------------------------------------------------
+    function iSweep(isGFR, keepSample)
+        % One sweep over the mean forest, the variance forest and the
+        % variance parameters. Nested so it can share the sampler state
+        % rather than threading a dozen handles through an argument list.
+        if keepSample
+            sampleCounter = sampleCounter + 1;
+            chainIndex(sampleCounter) = currentChain;
+        end
+
+        meanOpts.gfr = isGFR;
+        meanOpts.keepForest = keepSample;
+        meanOpts.globalVariance = currentSigma2;
+        meanOpts.leafModelScale = currentLeafScale;
+        samplerMean.sampleOneIteration(forestContainerMean, activeForestMean, ...
+            datasetTrain, residual, cppRng, meanOpts);
+
+        if includeVarianceForest
+            varOpts.gfr = isGFR;
+            varOpts.keepForest = keepSample;
+            varOpts.globalVariance = currentSigma2;
+            samplerVar.sampleOneIteration(forestContainerVar, activeForestVar, ...
+                datasetTrain, residual, cppRng, varOpts);
+        end
+
+        if opts.SampleSigma2Global
+            currentSigma2 = globalVarModel.sample(residual, cppRng, aGlobal, bGlobal);
+            if keepSample
+                globalVarSamples(sampleCounter) = currentSigma2;
+            end
+        end
+        if sampleSigma2Leaf
+            currentLeafScale = leafVarModel.sample(activeForestMean, cppRng, aLeaf, bLeaf);
+            if keepSample
+                leafScaleSamples(sampleCounter) = currentLeafScale;
+            end
+        end
+    end
+
+    function iResetChain(chain)
+        % Put the sampler back into a warm start state before running a chain.
+        %
+        % reconstitute() repairs the residual incrementally: it adds back the
+        % tracker's cached predictions and subtracts the new forest's, so the
+        % residual stays consistent without ever being recomputed from y. That
+        % is why the forests must be swapped in before the tracker is rebuilt.
+        if numGFR > 0
+            % Chains walk backwards through the warm start draws so that
+            % chain 1 continues from where the warm start left off.
+            forestInd = numGFR - chain + 1;
+            activeForestMean.resetFromContainer(forestContainerMean, forestInd);
+            samplerMean.reconstitute(activeForestMean, datasetTrain, residual, true);
+            if sampleSigma2Leaf
+                currentLeafScale = leafScaleSamples(forestInd);
+            end
+            if opts.SampleSigma2Global
+                currentSigma2 = globalVarSamples(forestInd);
+            end
+            if includeVarianceForest
+                activeForestVar.resetFromContainer(forestContainerVar, forestInd);
+                samplerVar.reconstitute(activeForestVar, datasetTrain, residual, false);
+            end
+        else
+            % No warm start: every chain starts from a stump at the prior mean.
+            activeForestMean.resetRoot();
+            if leafModel == 2
+                activeForestMean.setRootVector( ...
+                    repmat(initValMean / opts.NumTrees, numBasis, 1));
+            else
+                activeForestMean.setRootValue(initValMean / opts.NumTrees);
+            end
+            samplerMean.reconstitute(activeForestMean, datasetTrain, residual, true);
+            currentSigma2 = sigma2Init;
+            currentLeafScale = initialLeafScale;
+            if includeVarianceForest
+                activeForestVar.resetRoot();
+                activeForestVar.setRootValue( ...
+                    log(varianceForestLeafInit) / opts.NumTreesVariance);
+                samplerVar.reconstitute(activeForestVar, datasetTrain, residual, false);
+            end
+        end
+    end
 end
 
 % -------------------------------------------------------------------------
@@ -400,6 +486,7 @@ addParameter(q, 'NumMCMC', 100);
 addParameter(q, 'KeepGFR', false);
 addParameter(q, 'KeepBurnin', false);
 addParameter(q, 'KeepEvery', 1);
+addParameter(q, 'NumChains', 1);
 addParameter(q, 'RandomSeed', []);
 addParameter(q, 'NumThreads', 1);
 addParameter(q, 'CutpointGridSize', 100);

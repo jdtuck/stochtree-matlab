@@ -1,0 +1,3 @@
+[submodule "stochtree"]
+	path = stochtree
+	url = https://github.com/StochasticTree/stochtree.git

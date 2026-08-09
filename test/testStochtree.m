@@ -223,6 +223,206 @@ model = stochtree.bart(X, y, 'NumGFR', 2, 'NumMCMC', 5, 'NumTrees', 10, 'RandomS
 testCase.verifyError(@() model.predict(rand(10, 5)), 'stochtree:size');
 end
 
+%% ---- Multi-chain tests --------------------------------------------------
+
+function testBartMultipleChainsSampleCount(testCase)
+rng(101);
+X = rand(200, 3);
+y = X(:,1) * 2 + randn(200, 1) * 0.3;
+
+model = stochtree.bart(X, y, 'NumGFR', 10, 'NumBurnin', 5, 'NumMCMC', 20, ...
+    'NumChains', 4, 'NumTrees', 20, 'RandomSeed', 21);
+
+testCase.verifyEqual(model.NumChains, 4);
+testCase.verifyEqual(model.NumSamples, 80, ...
+    'Retained draws should be NumChains * NumMCMC.');
+testCase.verifySize(model.YHatTrain, [200, 80]);
+testCase.verifyNumElements(model.ChainIndex, 80);
+% Each chain should contribute exactly NumMCMC draws, in contiguous blocks.
+testCase.verifyEqual(sort(unique(model.ChainIndex))', 1:4);
+for c = 1:4
+    testCase.verifyEqual(sum(model.ChainIndex == c), 20);
+end
+end
+
+function testBartKeepEveryThinsWithoutLosingDraws(testCase)
+rng(103);
+X = rand(150, 3);
+y = X(:,1) * 2 + randn(150, 1) * 0.3;
+
+% NumMCMC is the retained count; KeepEvery multiplies the iterations run.
+model = stochtree.bart(X, y, 'NumGFR', 5, 'NumMCMC', 10, 'KeepEvery', 3, ...
+    'NumChains', 2, 'NumTrees', 20, 'RandomSeed', 22);
+testCase.verifyEqual(model.NumSamples, 20);
+end
+
+function testBartKeepGFRRetainsWarmStart(testCase)
+rng(105);
+X = rand(150, 3);
+y = X(:,1) * 2 + randn(150, 1) * 0.3;
+
+model = stochtree.bart(X, y, 'NumGFR', 6, 'NumMCMC', 10, 'NumChains', 2, ...
+    'KeepGFR', true, 'NumTrees', 20, 'RandomSeed', 23);
+testCase.verifyEqual(model.NumSamples, 6 + 2*10);
+% Warm start draws are labelled 0 so they can be told apart from chain draws.
+testCase.verifyEqual(sum(model.ChainIndex == 0), 6);
+end
+
+function testChainsAreDistinctButAgree(testCase)
+rng(107);
+n = 400;
+X = rand(n, 4);
+f = 5*X(:,1) + 3*X(:,2).^2;
+y = f + randn(n, 1) * 0.5;
+
+model = stochtree.bart(X, y, 'NumGFR', 10, 'NumBurnin', 50, 'NumMCMC', 60, ...
+    'NumChains', 4, 'NumTrees', 50, 'RandomSeed', 24);
+
+% Chains must not be identical -- that would mean the reset failed and every
+% chain simply continued the same trajectory.
+M = model.chainMatrix(model.Sigma2Samples);
+testCase.verifySize(M, [60, 4]);
+testCase.verifyGreaterThan(max(std(M, 0, 1)), 0, ...
+    'Chains should differ from one another.');
+
+% ...but their posterior means should agree to within sampling noise.
+chainMeans = mean(M, 1);
+testCase.verifyLessThan(range(chainMeans) / mean(chainMeans), 0.5, ...
+    'Chain means for sigma^2 should be broadly consistent.');
+
+% The pooled fit should still be good.
+yhat = mean(model.YHatTrain, 2);
+r2 = 1 - sum((f - yhat).^2) / sum((f - mean(f)).^2);
+testCase.verifyGreaterThan(r2, 0.85);
+end
+
+function testChainResetKeepsResidualConsistent(testCase)
+% If the residual were left stale after a chain reset, the later chains would
+% fit a corrupted target and their predictions would drift away from the
+% earlier ones. Compare the first and last chain's posterior means.
+rng(109);
+n = 400;
+X = rand(n, 3);
+f = 4*X(:,1) - 2*X(:,2);
+y = f + randn(n, 1) * 0.4;
+
+model = stochtree.bart(X, y, 'NumGFR', 8, 'NumBurnin', 50, 'NumMCMC', 50, ...
+    'NumChains', 4, 'NumTrees', 40, 'RandomSeed', 25);
+
+first = mean(model.YHatTrain(:, model.ChainIndex == 1), 2);
+last = mean(model.YHatTrain(:, model.ChainIndex == 4), 2);
+testCase.verifyGreaterThan(corr(first, last), 0.95, ...
+    'Later chains should agree with earlier ones after the reset.');
+testCase.verifyLessThan(mean(abs(first - last)), 0.5 * std(y));
+end
+
+function testChainsFromRootWithoutWarmStart(testCase)
+rng(111);
+X = rand(300, 3);
+y = 3*X(:,1) + randn(300, 1) * 0.4;
+
+% NumGFR = 0 means every chain restarts from a stump instead of a warm start,
+% so NumChains is not capped by NumGFR.
+model = stochtree.bart(X, y, 'NumGFR', 0, 'NumBurnin', 50, 'NumMCMC', 30, ...
+    'NumChains', 3, 'NumTrees', 30, 'RandomSeed', 26);
+testCase.verifyEqual(model.NumSamples, 90);
+yhat = mean(model.YHatTrain, 2);
+testCase.verifyGreaterThan(corr(yhat, y), 0.8);
+end
+
+function testTooManyChainsRejected(testCase)
+X = rand(100, 3);
+y = rand(100, 1);
+testCase.verifyError( ...
+    @() stochtree.bart(X, y, 'NumGFR', 3, 'NumChains', 5, 'NumMCMC', 5), ...
+    'stochtree:value');
+testCase.verifyError( ...
+    @() stochtree.bart(X, y, 'NumChains', 0, 'NumMCMC', 5), 'stochtree:value');
+end
+
+function testBcfMultipleChains(testCase)
+rng(113);
+n = 600;
+X = rand(n, 4);
+propensity = 0.3 + 0.4 * X(:,1);
+Z = double(rand(n, 1) < propensity);
+tau = 1 + X(:,2);
+y = 2*X(:,1) + tau .* Z + 0.4 * randn(n, 1);
+
+model = stochtree.bcf(X, Z, y, 'PropensityTrain', propensity, ...
+    'NumGFR', 10, 'NumBurnin', 50, 'NumMCMC', 50, 'NumChains', 3, ...
+    'RandomSeed', 27);
+
+testCase.verifyEqual(model.NumChains, 3);
+testCase.verifyEqual(model.NumSamples, 150);
+testCase.verifyNumElements(model.B0Samples, 150);
+testCase.verifyTrue(all(isfinite(model.B0Samples)));
+
+% The ATE should be consistent across chains, which also confirms the
+% adaptive coding state was reset properly at each chain boundary.
+ateByChain = arrayfun(@(c) mean(mean(model.TauHatTrain(:, model.ChainIndex == c), 2)), 1:3);
+testCase.verifyLessThan(range(ateByChain), 0.5, ...
+    'Per-chain ATE estimates should agree.');
+testCase.verifyLessThan(abs(mean(ateByChain) - mean(tau)), 0.5);
+end
+
+%% ---- R-hat tests ---------------------------------------------------------
+
+function testRhatOnIdenticalChainsIsOne(testCase)
+rng(115);
+% Four chains drawn from the same distribution: R-hat should sit near 1.
+X = randn(500, 4);
+R = stochtree.rhat(X);
+testCase.verifyGreaterThan(R, 0.99);
+testCase.verifyLessThan(R, 1.05);
+end
+
+function testRhatDetectsSeparatedChains(testCase)
+% Chains centred in different places must be flagged.
+X = randn(200, 4) + [0 5 10 15];
+R = stochtree.rhat(X);
+testCase.verifyGreaterThan(R, 1.5);
+end
+
+function testRhatWithChainIndex(testCase)
+draws = [randn(100,1); randn(100,1) + 8];
+idx = [ones(100,1); 2*ones(100,1)];
+R = stochtree.rhat(draws, idx);
+testCase.verifyGreaterThan(R, 1.5);
+
+% Warm start draws, labelled 0, must be excluded rather than pooled in.
+drawsWithGFR = [zeros(5,1); draws];
+idxWithGFR = [zeros(5,1); idx];
+testCase.verifyEqual(stochtree.rhat(drawsWithGFR, idxWithGFR), R, 'AbsTol', 1e-12);
+end
+
+function testRhatRejectsSingleChain(testCase)
+testCase.verifyError(@() stochtree.rhat(randn(100,1)), 'stochtree:input');
+testCase.verifyError(@() stochtree.rhat(randn(10,1), ones(10,1)), 'stochtree:value');
+end
+
+function testConvergenceDiagnostics(testCase)
+rng(117);
+X = rand(250, 3);
+y = 3*X(:,1) + randn(250, 1) * 0.4;
+
+model = stochtree.bart(X, y, 'NumGFR', 8, 'NumBurnin', 40, 'NumMCMC', 40, ...
+    'NumChains', 4, 'NumTrees', 30, 'RandomSeed', 28);
+d = model.convergenceDiagnostics();
+testCase.verifyEqual(d.numChains, 4);
+testCase.verifyTrue(isfield(d, 'sigma2Rhat'));
+testCase.verifyTrue(isfinite(d.sigma2Rhat));
+testCase.verifyGreaterThan(d.sigma2Rhat, 0.9);
+
+% A single chain has nothing to compare against, and should say so rather
+% than returning a meaningless number.
+single = stochtree.bart(X, y, 'NumGFR', 5, 'NumMCMC', 20, 'NumTrees', 20, ...
+    'RandomSeed', 29);
+d1 = single.convergenceDiagnostics();
+testCase.verifyTrue(isnan(d1.sigma2Rhat));
+testCase.verifyTrue(isfield(d1, 'note'));
+end
+
 %% ---- BCF tests ----------------------------------------------------------
 
 function testBcfRecoversHeterogeneousEffect(testCase)

@@ -13,10 +13,10 @@ This sits alongside the project's existing R and Python interfaces and wraps the
 ## Installation
 
 ```bash
-git clone --recursive https://github.com/StochasticTree/stochtree.git
+git clone --recurse-submodules https://github.com/jdtuck/stochtree-matlab
 ```
 
-The `--recursive` flag matters: Eigen, Boost.Math, fmt and fast_double_parser are git submodules. If you already cloned without it, run `git submodule update --init --recursive` inside the checkout.
+The `--recurse-submodules` flag matters: Eigen, Boost.Math, fmt and fast_double_parser are git submodules. If you already cloned without it, run `git submodule update --init --recursive` inside the checkout.
 
 Then, in MATLAB:
 
@@ -48,6 +48,19 @@ yhat = mean(model.YHatTrain, 2);              % posterior mean
 ci   = quantile(model.YHatTrain, [.025 .975], 2);   % 95% interval
 out  = model.predict(Xnew);                   % draws for new data
 ```
+
+### Multiple chains
+
+```matlab
+model = stochtree.bart(X, y, ...
+    'NumGFR', 10, 'NumBurnin', 200, 'NumMCMC', 300, 'NumChains', 4);
+
+model.NumSamples                    % 1200 = 4 chains x 300 draws
+model.convergenceDiagnostics()      % split R-hat for sigma^2 and predictions
+plot(model.chainMatrix(model.Sigma2Samples))   % per-chain trace
+```
+
+Chains are pooled into a single set of draws; `model.ChainIndex` labels which chain each draw came from. See the section below for how the warm start interacts with chains.
 
 ### Bayesian Causal Forest
 
@@ -88,10 +101,24 @@ Three details worth knowing:
 |---|---|
 | `stochtree.bart(X, y, ...)` | BART / XBART regression, returns `stochtree.BARTModel` |
 | `stochtree.bcf(X, Z, y, ...)` | Bayesian Causal Forest, returns `stochtree.BCFModel` |
+| `stochtree.rhat(draws, chainIdx)` | Split Gelman-Rubin convergence diagnostic |
 
 Both accept `NumGFR` (grow-from-root warm start), `NumBurnin` and `NumMCMC`. `NumGFR = 0` gives plain BART; `NumMCMC = 0` gives plain XBART. See `help stochtree.bart` for the full option list.
 
-`BARTModel` provides `predict`, `posteriorMean`, `credibleInterval`, `variableSplitCounts`, `summary`, `toStruct`/`fromStruct` and `save`/`load`. `BCFModel` adds `ateSamples`, `ateSummary` and `posteriorCATE`.
+`BARTModel` provides `predict`, `posteriorMean`, `credibleInterval`, `variableSplitCounts`, `summary`, `chainMatrix`, `convergenceDiagnostics`, `toStruct`/`fromStruct` and `save`/`load`. `BCFModel` adds `ateSamples`, `ateSummary` and `posteriorCATE`.
+
+### How chains work
+
+`NumGFR` grow-from-root iterations run **once**, shared by every chain. Chain *c* then restarts the sampler from warm start draw `NumGFR - c + 1` and runs `NumBurnin + NumMCMC*KeepEvery` iterations, retaining `NumMCMC`. This is the same scheme the Python package uses, and it has two consequences:
+
+- **`NumChains` cannot exceed `NumGFR`,** since each chain needs its own warm start draw. Set `NumGFR` to 0 to start every chain from a stump instead, in which case there is no cap.
+- **`NumMCMC` is the retained count per chain,** not the iteration count. Total draws are `NumChains * NumMCMC`.
+
+Restarting a chain swaps the active forest for a stored draw and then rebuilds the sampler's tracker, which repairs the partial residual incrementally rather than recomputing it from the outcome. For BCF the prognostic and treatment forests share one residual, so each is swapped and reconstituted in turn and the adaptive coding basis is reapplied last.
+
+Because the warm starts all come from a single grow-from-root trajectory, the chains begin close together and BART's tree structures mix slowly. **Use a real burn-in with multiple chains.** In testing, four chains on Friedman data gave R-hat 1.33 for sigma^2 with no burn-in and 1.16 with 200 burn-in iterations, with chain means tightening from {1.04, 1.08, 1.04, 1.11} to {0.99, 0.99, 1.00, 1.04} against a truth of 1.0.
+
+R-hat on BART is most meaningful for scalar parameters like sigma^2 or for predictions at a point. The forest structure itself is not identified, so do not expect it to converge in any labelled sense.
 
 Models serialize through the C++ JSON representation, so `save`/`load` produce ordinary `.mat` files with no live handles in them.
 
@@ -113,14 +140,15 @@ The gateway and both sampling loops were verified end to end before release:
 | BCF on confounded data (n=1000) | corr(τ̂, τ) 0.978, ATE 2.06 vs true 2.02, σ 0.485 vs true 0.5 |
 | Forest JSON round-trip | bit-identical predictions |
 | Handle lifetime | stale handles, double-free and type confusion all rejected |
+| Chain reset (4 chains) | residual consistency after reconstitute within 1e-15 |
 
-`test/testStochtree.m` covers the same ground from MATLAB, plus leaf-basis regression, heteroskedastic BART, seed reproducibility, serialization and input validation.
+`test/testStochtree.m` covers the same ground from MATLAB across 34 tests, plus leaf-basis regression, heteroskedastic BART, multi-chain bookkeeping, chain agreement, R-hat, seed reproducibility, serialization and input validation.
 
 ## Current limitations
 
 - **Random effects are not exposed.** The `RandomEffects*` classes in the C++ core have no MATLAB binding yet. Adding them means about six more object types in the gateway.
-- **Single chain only.** `num_chains > 1` from the Python package is not implemented. Run `bart` several times with different seeds and pool the draws if you need multiple chains.
 - **No ordinal or probit outcomes.** The gateway exposes the cloglog ordinal leaf model (code 4), but `bart` does not yet drive it, and the probit path is not implemented.
+- **Chains run sequentially.** They are independent and would parallelize cleanly over `parfor`, but the C++ objects are handles into one shared registry, so that needs the forests serialized per worker. Not done yet.
 - **Categorical preprocessing is manual.** Pass integer-coded categoricals and mark them via `'CategoricalIndices'` or `'FeatureTypes'`; there is no equivalent of Python's `CovariateTransformer` yet.
 - **`SampleWeights` and a variance forest conflict.** Initializing a variance forest overwrites the dataset's variance weights. This matches the Python package's behaviour, but it means the two options should not be combined.
 
