@@ -1,3 +1,5 @@
+[![Pipeline Status](https://github.com/jdtuck/stochtree-matlab/actions/workflows/matlab.yml/badge.svg)](https://github.com/jdtuck/stochtree-matlab/actions/workflows/matlab.yml)
+
 # stochtree for MATLAB
 
 A MATLAB wrapper for [stochtree](https://github.com/StochasticTree/stochtree) — stochastic tree ensembles (BART / XBART) for supervised learning and causal inference.
