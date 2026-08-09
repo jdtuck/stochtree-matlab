@@ -3,7 +3,7 @@
 % variable importance summary.
 
 clear; close all;
-rng(1);
+rng(1, 'twister');
 
 %% Simulate data
 n = 750;

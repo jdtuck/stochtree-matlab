@@ -135,7 +135,7 @@ y = X(:,1) * 3 + randn(150, 1) * 0.3;
 model = stochtree.bart(X, y, 'NumGFR', 5, 'NumMCMC', 20, 'NumTrees', 20, ...
     'RandomSeed', 2);
 
-out = model.predict(X);
+out = model.predict(X, 'samplesOnly',false);
 testCase.verifyEqual(out.yhat, model.YHatTrain, 'AbsTol', 1e-10, ...
     'Re-predicting the training data must reproduce the stored draws exactly.');
 end
@@ -153,7 +153,7 @@ model = stochtree.bart(X, y, 'W', W, 'NumGFR', 10, 'NumMCMC', 50, ...
 testCase.verifyTrue(model.HasBasis);
 testCase.verifyEqual(model.LeafModel, 1);
 
-yhat = mean(model.predict(X, W).yhat, 2);
+yhat = mean(model.predict(X, 'W', W, 'samplesOnly',false).yhat, 2);
 r2 = 1 - sum((y - yhat).^2) / sum((y - mean(y)).^2);
 testCase.verifyGreaterThan(r2, 0.8);
 end
@@ -186,7 +186,7 @@ XTest = rand(50, 3);
 model = stochtree.bart(X, y, 'XTest', XTest, 'NumGFR', 5, 'NumMCMC', 20, ...
     'NumTrees', 20, 'RandomSeed', 5);
 testCase.verifySize(model.YHatTest, [50, 20]);
-testCase.verifyEqual(model.YHatTest, model.predict(XTest).yhat, 'AbsTol', 1e-10);
+testCase.verifyEqual(model.YHatTest, model.predict(XTest, 'samplesOnly',false).yhat, 'AbsTol', 1e-10);
 end
 
 function testBartSerializationRoundTrip(testCase)
@@ -198,7 +198,7 @@ model = stochtree.bart(X, y, 'NumGFR', 5, 'NumMCMC', 20, 'NumTrees', 20, ...
 
 restored = stochtree.BARTModel.fromStruct(model.toStruct());
 testCase.verifyEqual(restored.NumSamples, model.NumSamples);
-testCase.verifyEqual(restored.predict(X).yhat, model.predict(X).yhat, ...
+testCase.verifyEqual(restored.predict(X, 'samplesOnly',false).yhat, model.predict(X, 'samplesOnly',false).yhat, ...
     'AbsTol', 1e-10, 'Serialization must be lossless.');
 end
 

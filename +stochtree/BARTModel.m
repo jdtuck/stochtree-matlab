@@ -41,10 +41,12 @@ classdef BARTModel < handle
         NumMCMC (1,1) double = 0
         NumChains (1,1) double = 1
         ChainIndex double = []
+
+        samples
     end
 
     methods
-        function out = predict(obj, X, W)
+        function out = predict(obj, X, options)
             %PREDICT Posterior predictive draws of the conditional mean.
             %
             %   OUT = PREDICT(MODEL, X) returns a struct with field yhat, an
@@ -54,7 +56,20 @@ classdef BARTModel < handle
             %
             %   OUT = PREDICT(MODEL, X, W) supplies the leaf regression basis
             %   for models fit with the 'W' option.
-            if nargin < 3, W = []; end
+            arguments
+                obj
+                X
+                options.W = []
+                options.idxSamples = nan
+                options.samplesOnly = true
+            end
+            W = options.W;
+            idxSamples = options.idxSamples;
+
+            if isnan(idxSamples) 
+                idxSamples = 1:obj.NumSamples;
+            end
+
             X = stochtree.internal.asMatrix(X, 'X');
             if size(X, 2) ~= obj.NumCovariates
                 error('stochtree:size', ...
@@ -90,12 +105,16 @@ classdef BARTModel < handle
                     out.sigma2x = sigma2Raw * obj.Sigma2Init * obj.YStd^2;
                 end
             end
+
+            if options.samplesOnly
+                out = out.yhat(:,idxSamples)';
+            end
         end
 
         function m = posteriorMean(obj, X, W)
             %POSTERIORMEAN Posterior mean prediction, averaged over draws.
             if nargin < 3, W = []; end
-            p = obj.predict(X, W);
+            p = obj.predict(X, 'W', W, 'samplesOnly',false);
             m = mean(p.yhat, 2);
         end
 

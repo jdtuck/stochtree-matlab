@@ -357,12 +357,13 @@ model.NumBurnin = numBurnin;
 model.NumMCMC = numMCMC;
 model.NumChains = numChains;
 model.ChainIndex = chainIndex;
+model.samples.s2 = opts.SampleSigma2Global;
 
 % Global variance draws are reported on the original outcome scale.
 model.Sigma2Samples = globalVarSamples * yStd^2;
 model.LeafScaleSamples = leafScaleSamples;
 
-trainPred = model.predict(X, W);
+trainPred = model.predict(X, 'W', W, 'samplesOnly',false);
 model.YHatTrain = trainPred.yhat;
 if includeVarianceForest
     model.Sigma2XTrain = trainPred.sigma2x;
@@ -377,7 +378,7 @@ if ~isempty(opts.XTest)
     if hasBasis && isempty(WTest)
         error('stochtree:input', 'WTest is required when W and XTest are both supplied.');
     end
-    testPred = model.predict(XTest, WTest);
+    testPred = model.predict(XTest, 'W', WTest, 'samplesOnly',false);
     model.YHatTest = testPred.yhat;
     if includeVarianceForest
         model.Sigma2XTest = testPred.sigma2x;
