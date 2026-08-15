@@ -357,10 +357,10 @@ model.NumBurnin = numBurnin;
 model.NumMCMC = numMCMC;
 model.NumChains = numChains;
 model.ChainIndex = chainIndex;
-model.samples.s2 = opts.SampleSigma2Global;
 
 % Global variance draws are reported on the original outcome scale.
 model.Sigma2Samples = globalVarSamples * yStd^2;
+model.samples.s2 = model.Sigma2Samples;
 model.LeafScaleSamples = leafScaleSamples;
 
 trainPred = model.predict(X, 'W', W, 'samplesOnly',false);
