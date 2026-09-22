@@ -122,7 +122,7 @@ classdef BARTModel < handle
             %CREDIBLEINTERVAL Pointwise posterior interval, n-by-2.
             if nargin < 3 || isempty(level), level = 0.95; end
             if nargin < 4, W = []; end
-            p = obj.predict(X, W);
+            p = obj.predict(X, 'W', W, 'samplesOnly', false);
             tail = (1 - level) / 2;
             ci = quantile(p.yhat, [tail, 1 - tail], 2);
         end

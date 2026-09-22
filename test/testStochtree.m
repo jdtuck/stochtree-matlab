@@ -536,3 +536,119 @@ restored = stochtree.BCFModel.fromStruct(model.toStruct());
 testCase.verifyEqual(restored.predict(X, Z, pi_).tau, ...
     model.predict(X, Z, pi_).tau, 'AbsTol', 1e-10);
 end
+
+%% ---- Extra sampler paths ------------------------------------------------
+
+function testBartFeatureTypesLengthValidated(testCase)
+% FeatureTypes must have one entry per covariate column; a wrong length is a
+% user error caught in MATLAB before anything reaches the C++ core.
+%
+% Note: exercising an *unordered categorical* feature end-to-end is
+% deliberately not tested here. The C++ core expects categorical inputs to be
+% preprocessed into contiguous 0-based codes (see the "manual categorical
+% prep" limitation in the README); handing it raw levels is unsupported.
+X = rand(50, 3);
+y = rand(50, 1);
+testCase.verifyError(@() stochtree.bart(X, y, 'FeatureTypes', [0 0]), ...
+    'stochtree:size');
+end
+
+function testBartXbartOnly(testCase)
+% NumMCMC = 0 gives pure grow-from-root (XBART). The retained draws are the
+% GFR draws, so KeepGFR must be on for anything to be kept.
+rng(203);
+X = rand(250, 3);
+y = 3 * X(:,1) + randn(250, 1) * 0.4;
+
+model = stochtree.bart(X, y, 'NumGFR', 20, 'NumMCMC', 0, 'KeepGFR', true, ...
+    'NumTrees', 30, 'RandomSeed', 72);
+testCase.verifyEqual(model.NumMCMC, 0);
+testCase.verifyEqual(model.NumSamples, 20);
+yhat = mean(model.YHatTrain, 2);
+testCase.verifyGreaterThan(corr(yhat, y), 0.8, ...
+    'XBART-only should still fit the mean.');
+end
+
+function testBartNoStandardize(testCase)
+% With Standardize off the outcome is modelled on its raw scale, so YBar/YStd
+% must be the no-op transform. The default priors are calibrated for a roughly
+% centred outcome, so this checks the mechanics (transform + finite, correctly
+% shaped predictions) rather than asserting a particular fit quality, which the
+% un-standardized path does not guarantee for an arbitrary outcome location.
+rng(205);
+X = rand(300, 3);
+y = 20 * X(:,1) - 10 + 3 * randn(300, 1);   % roughly centred, raw scale
+
+model = stochtree.bart(X, y, 'Standardize', false, 'NumGFR', 10, ...
+    'NumMCMC', 60, 'NumTrees', 40, 'RandomSeed', 73);
+testCase.verifyFalse(model.Standardize);
+testCase.verifyEqual(model.YBar, 0, 'AbsTol', 1e-12);
+testCase.verifyEqual(model.YStd, 1, 'AbsTol', 1e-12);
+
+yhat = mean(model.YHatTrain, 2);
+testCase.verifySize(yhat, [size(X, 1), 1]);
+testCase.verifyTrue(all(isfinite(yhat)), ...
+    'Un-standardized predictions must be finite.');
+end
+
+function testBartSampleWeights(testCase)
+% Observation variance weights are accepted and the model fits. Down-weighting
+% is expressed as a larger variance weight, so give the noisy half of the data
+% a higher weight and confirm the model still recovers the mean.
+rng(207);
+n = 400;
+X = rand(n, 3);
+f = 4 * X(:,1);
+noiseScale = [0.2 * ones(n/2, 1); 1.5 * ones(n/2, 1)];
+y = f + noiseScale .* randn(n, 1);
+w = noiseScale.^2;                  % variance weights proportional to variance
+
+model = stochtree.bart(X, y, 'SampleWeights', w, 'NumGFR', 10, ...
+    'NumMCMC', 60, 'NumTrees', 40, 'RandomSeed', 74);
+yhat = mean(model.YHatTrain, 2);
+r2 = 1 - sum((f - yhat).^2) / sum((f - mean(f)).^2);
+testCase.verifyGreaterThan(r2, 0.7, ...
+    'Weighted BART should still recover the underlying mean.');
+end
+
+function testBcfContinuousTreatmentPrediction(testCase)
+% For a continuous treatment adaptive coding is off and tau is the per-unit
+% slope. Prediction should return the raw tau draws and a consistent yhat.
+rng(209);
+n = 400;
+X = rand(n, 3);
+Z = randn(n, 1);
+slope = 0.8;
+y = 2 * X(:,1) + slope * Z + 0.3 * randn(n, 1);
+
+model = testCase.verifyWarning( ...
+    @() stochtree.bcf(X, Z, y, 'PropensityCovariate', 'none', ...
+        'NumGFR', 10, 'NumMCMC', 60, 'RandomSeed', 75), ...
+    'stochtree:adaptiveCoding');
+testCase.verifyFalse(model.BinaryTreatment);
+testCase.verifyFalse(model.AdaptiveCoding);
+
+out = model.predict(X, Z);
+testCase.verifySize(out.tau, [n, model.NumSamples]);
+testCase.verifySize(out.yhat, [n, model.NumSamples]);
+
+% The posterior mean slope should be in the neighbourhood of the truth.
+tauHat = mean(out.tau(:));
+testCase.verifyLessThan(abs(tauHat - slope), 0.4, ...
+    'Continuous-treatment CATE should recover the slope.');
+end
+
+function testBcfAteSamplesRequiresTrainingDraws(testCase)
+% ateSamples reads TauHatTrain; a model rebuilt without it should refuse
+% rather than return a meaningless value.
+rng(211);
+n = 200;
+X = rand(n, 3);
+Z = double(rand(n, 1) < 0.5);
+y = X(:,1) + Z + 0.3 * randn(n, 1);
+model = stochtree.bcf(X, Z, y, 'PropensityTrain', repmat(0.5, n, 1), ...
+    'NumGFR', 5, 'NumMCMC', 20, 'RandomSeed', 76);
+
+model.TauHatTrain = [];
+testCase.verifyError(@() model.ateSamples(), 'stochtree:state');
+end
